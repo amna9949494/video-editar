@@ -1,211 +1,207 @@
-/* ==========================================================================
-   api.js – backend communication layer
+/* ══════════════════════════════════════════════════════════════
+   api.js — Backend contract & mock implementation
+   Wan 2.1 (Text-to-Video / Image-to-Video)
+══════════════════════════════════════════════════════════════ */
 
-   Exposes a single global: window.VideoAPI
-     VideoAPI.config                     – editable settings
-     VideoAPI.generateVideo(options)     – submit a job and resolve with { videoUrl }
-     VideoAPI.downloadVideo(url, name)   – save a generated video
+'use strict';
 
-   Mock mode is ON by default so the UI works offline from index.html.
-   To connect your real backend, set USE_MOCK to false and point BASE_URL at it.
+const API_CONFIG = {
+  useMock: true,
+  baseUrl: '/api',
 
-   Expected backend contract (adapt the field names below if yours differ):
-     POST {BASE_URL}/api/generate   multipart/form-data
-          fields: prompt, aspect_ratio ("16:9"), duration (seconds), image (optional file)
-          returns: { "job_id": "abc123" }
-     GET  {BASE_URL}/api/jobs/:id
-          returns: { "status": "queued" | "processing" | "completed" | "failed",
-                     "progress": 0-100 (optional),
-                     "video_url": "https://..." (when completed),
-                     "error": "message" (when failed) }
-   ========================================================================== */
+  models: {
+    textToVideo: 'Wan-AI/Wan2.1-T2V-14B',
+    imageToVideo: 'Wan-AI/Wan2.1-I2V-14B-720P',
+  },
 
-(function (global) {
-  'use strict';
+  pollIntervalMs: 1500,
+  timeoutMs: 300_000,
 
-  const API_CONFIG = {
-    USE_MOCK: true,
-    BASE_URL: 'https://your-backend.example.com',
-    ENDPOINTS: {
-      generate: '/api/generate',
-      job: (id) => `/api/jobs/${encodeURIComponent(id)}`,
-    },
-    POLL_INTERVAL_MS: 2500,
-    TIMEOUT_MS: 15 * 60 * 1000, // give up after 15 minutes
+  maxImageBytes: 10 * 1024 * 1024,
+  acceptedImageTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+
+  /** Duration → credit cost multiplier (used by the UI + backend later). */
+  durationCosts: {
+    '5s': 1,
+    '10s': 2,
+    '1m': 12,
+    '6m': 72,
+  },
+};
+
+/* ─────────────── Mock assets ─────────────── */
+const MOCK_LIBRARY = [
+  {
+    videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4',
+    poster: 'https://picsum.photos/seed/lumen-neon/1280/720',
+    resolution: '1280×720',
+    seed: 428913,
+  },
+  {
+    videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    poster: 'https://picsum.photos/seed/lumen-ink/1280/720',
+    resolution: '1280×720',
+    seed: 771204,
+  },
+  {
+    videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
+    poster: 'https://picsum.photos/seed/lumen-drone/1280/720',
+    resolution: '1280×720',
+    seed: 305618,
+  },
+];
+
+const STAGES = [
+  { at: 0,  label: 'Initializing Wan 2.1 pipeline…' },
+  { at: 10, label: 'Encoding prompt with T5-XXL…' },
+  { at: 24, label: 'Sampling latent noise · step 8/30' },
+  { at: 42, label: 'Denoising diffusion · step 18/30' },
+  { at: 62, label: 'Temporal attention pass · step 26/30' },
+  { at: 80, label: 'Decoding VAE latents…' },
+  { at: 92, label: 'Upscaling to 720p & muxing…' },
+];
+
+/* ─────────────── Helpers ─────────────── */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+function validateImage(file) {
+  if (!file) return { ok: false, error: 'No file provided.' };
+  if (!API_CONFIG.acceptedImageTypes.includes(file.type)) {
+    return { ok: false, error: 'Unsupported format. Use PNG, JPG, WEBP or GIF.' };
+  }
+  if (file.size > API_CONFIG.maxImageBytes) {
+    return { ok: false, error: 'Image exceeds the 10 MB limit.' };
+  }
+  return { ok: true };
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MOCK GENERATION
+══════════════════════════════════════════════════════════════ */
+async function mockGenerate({ prompt, imageFile, duration, onProgress, signal }) {
+  let progress = 0;
+  let stageIndex = 0;
+
+  // Longer durations take longer to "render"
+  const durationMultiplier = { '5s': 1, '10s': 1.25, '1m': 1.6, '6m': 2.1 };
+  const baseStep = imageFile ? 4.5 : 6;
+  const stepSize = baseStep / (durationMultiplier[duration] || 1);
+
+  while (progress < 100) {
+    if (signal?.aborted) throw new DOMException('Generation aborted', 'AbortError');
+
+    await sleep(180 + Math.random() * 300);
+    progress = Math.min(100, progress + Math.random() * stepSize + 2.5);
+
+    while (stageIndex < STAGES.length - 1 && progress >= STAGES[stageIndex + 1].at) {
+      stageIndex += 1;
+    }
+
+    onProgress?.(Math.round(progress), STAGES[stageIndex].label);
+  }
+
+  onProgress?.(100, 'Finalizing…');
+  await sleep(420);
+
+  const asset = pickRandom(MOCK_LIBRARY);
+  return {
+    ...asset,
+    prompt,
+    duration,
+    mode: imageFile ? 'image-to-video' : 'text-to-video',
+    model: imageFile ? API_CONFIG.models.imageToVideo : API_CONFIG.models.textToVideo,
+    createdAt: new Date().toISOString(),
   };
+}
 
-  // Placeholder clips used by mock mode only.
-  const SAMPLE_VIDEOS = [
-    'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
-  ];
+/* ══════════════════════════════════════════════════════════════
+   REAL GENERATION (reference implementation — wire to your proxy)
+══════════════════════════════════════════════════════════════ */
+async function realGenerate({ prompt, imageFile, duration, onProgress, signal }) {
+  const form = new FormData();
+  form.append('prompt', prompt);
+  form.append('model', imageFile ? API_CONFIG.models.imageToVideo : API_CONFIG.models.textToVideo);
+  form.append('resolution', '720p');
+  form.append('duration', duration);          // ← e.g. "5s" | "10s" | "1m" | "6m"
+  form.append('aspect_ratio', '16:9');
+  if (imageFile) form.append('image', imageFile);
 
-  /* ------------------------------ helpers -------------------------------- */
+  const startRes = await fetch(`${API_CONFIG.baseUrl}/generate`, {
+    method: 'POST',
+    body: form,
+    signal,
+  });
+  if (!startRes.ok) throw new Error(`Generation request failed (${startRes.status})`);
 
-  class ApiError extends Error {
-    constructor(message, status) {
-      super(message);
-      this.name = 'ApiError';
-      this.status = status;
-    }
+  const { jobId } = await startRes.json();
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < API_CONFIG.timeoutMs) {
+    if (signal?.aborted) throw new DOMException('Generation aborted', 'AbortError');
+    await sleep(API_CONFIG.pollIntervalMs);
+
+    const statusRes = await fetch(`${API_CONFIG.baseUrl}/status/${jobId}`, { signal });
+    if (!statusRes.ok) continue;
+
+    const data = await statusRes.json();
+    onProgress?.(data.progress ?? 0, data.stage ?? 'Generating…');
+
+    if (data.status === 'succeeded') return data.result;
+    if (data.status === 'failed') throw new Error(data.error || 'Generation failed on the server.');
   }
 
-  const abortError = () => new DOMException('Generation cancelled', 'AbortError');
+  throw new Error('Generation timed out. Please try again.');
+}
 
-  /** Promise-based sleep that rejects immediately if the signal aborts. */
-  function sleep(ms, signal) {
+/* ══════════════════════════════════════════════════════════════
+   PUBLIC API
+══════════════════════════════════════════════════════════════ */
+const VideoAPI = {
+  config: API_CONFIG,
+
+  /**
+   * Generate a video.
+   * @param {Object}   params
+   * @param {string}   params.prompt
+   * @param {File}     [params.imageFile]
+   * @param {string}   [params.duration]   "5s" | "10s" | "1m" | "6m"
+   * @param {Function} [params.onProgress] (percent, label) => void
+   * @param {AbortSignal} [params.signal]
+   */
+  async generateVideo({ prompt, imageFile, duration = '5s', onProgress, signal }) {
+    if (imageFile) {
+      const check = validateImage(imageFile);
+      if (!check.ok) throw new Error(check.error);
+    }
+
+    if (API_CONFIG.useMock) {
+      return mockGenerate({ prompt, imageFile, duration, onProgress, signal });
+    }
+    return realGenerate({ prompt, imageFile, duration, onProgress, signal });
+  },
+
+  /** Read a File into a data URL for instant preview. */
+  readImagePreview(file) {
     return new Promise((resolve, reject) => {
-      if (signal && signal.aborted) return reject(abortError());
-      let timer;
-      const onAbort = () => {
-        clearTimeout(timer);
-        reject(abortError());
-      };
-      timer = setTimeout(() => {
-        if (signal) signal.removeEventListener('abort', onAbort);
-        resolve();
-      }, ms);
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Could not read the selected image.'));
+      reader.readAsDataURL(file);
     });
-  }
+  },
 
-  function endpoint(path) {
-    return API_CONFIG.BASE_URL.replace(/\/+$/, '') + path;
-  }
+  /** Credits cost for a given duration label. */
+  getDurationCost(duration) {
+    return API_CONFIG.durationCosts[duration] ?? 1;
+  },
 
-  async function toApiError(response) {
-    let detail = '';
-    try {
-      const data = await response.json();
-      detail = data.detail || data.error || data.message || '';
-    } catch (_) { /* response had no JSON body */ }
-    return new ApiError(detail || `The server responded with status ${response.status}.`, response.status);
-  }
+  /** Fetch quota (stub). */
+  async getQuota() {
+    if (API_CONFIG.useMock) return { credits: 240, plan: 'Pro' };
+    const res = await fetch(`${API_CONFIG.baseUrl}/quota`);
+    return res.json();
+  },
+};
 
-  /* ----------------------------- real backend ---------------------------- */
-
-  async function submitJob({ prompt, image, aspectRatio, duration, signal }) {
-    const body = new FormData();
-    body.append('prompt', prompt);
-    body.append('aspect_ratio', aspectRatio);
-    body.append('duration', String(duration));
-    if (image) body.append('image', image, image.name);
-
-    let response;
-    try {
-      response = await fetch(endpoint(API_CONFIG.ENDPOINTS.generate), { method: 'POST', body, signal });
-    } catch (err) {
-      if (err.name === 'AbortError') throw err;
-      throw new ApiError('Could not reach the server. Check your connection and try again.');
-    }
-    if (!response.ok) throw await toApiError(response);
-
-    const data = await response.json();
-    if (!data.job_id) throw new ApiError('The server did not return a job ID.');
-    return data.job_id;
-  }
-
-  async function fetchJob(jobId, signal) {
-    const response = await fetch(endpoint(API_CONFIG.ENDPOINTS.job(jobId)), { signal });
-    if (!response.ok) throw await toApiError(response);
-    return response.json();
-  }
-
-  async function pollJob(jobId, { onProgress, signal }) {
-    const startedAt = Date.now();
-    while (true) {
-      if (Date.now() - startedAt > API_CONFIG.TIMEOUT_MS) {
-        throw new ApiError('Generation took too long. Please try again.');
-      }
-      const job = await fetchJob(jobId, signal);
-
-      if (onProgress) {
-        onProgress({
-          status: job.status,
-          progress: typeof job.progress === 'number' ? job.progress : null,
-        });
-      }
-      if (job.status === 'completed') {
-        if (!job.video_url) throw new ApiError('The job finished without a video URL.');
-        return { videoUrl: job.video_url };
-      }
-      if (job.status === 'failed') {
-        throw new ApiError(job.error || 'Video generation failed.');
-      }
-      await sleep(API_CONFIG.POLL_INTERVAL_MS, signal);
-    }
-  }
-
-  async function realGenerate(options) {
-    const jobId = await submitJob(options);
-    return pollJob(jobId, options);
-  }
-
-  /* -------------------------------- mock --------------------------------- */
-
-  let sampleCursor = 0;
-
-  /**
-   * Simulates a ~8 second generation.
-   * Tip: include "#fail" in a prompt to test the error state.
-   */
-  async function mockGenerate({ prompt, signal, onProgress, startAt = 0 }) {
-    let progress = startAt;
-    if (onProgress) onProgress({ status: 'queued', progress });
-    await sleep(900, signal);
-
-    while (progress < 100) {
-      progress = Math.min(100, progress + 2 + Math.random() * 5);
-      if (onProgress) onProgress({ status: 'processing', progress: Math.round(progress) });
-
-      if (/#fail/i.test(prompt) && progress > 55) {
-        throw new ApiError('The model ran out of GPU memory. Try a shorter duration.');
-      }
-      await sleep(350, signal);
-    }
-
-    const videoUrl = SAMPLE_VIDEOS[sampleCursor++ % SAMPLE_VIDEOS.length];
-    return { videoUrl };
-  }
-
-  /* ------------------------------ public API ----------------------------- */
-
-  /**
-   * @param {Object}      options
-   * @param {string}      options.prompt
-   * @param {File|null}   options.image        optional reference image (image-to-video)
-   * @param {string}      options.aspectRatio  "16:9" | "9:16" | "1:1"
-   * @param {number}      options.duration     seconds
-   * @param {AbortSignal} [options.signal]
-   * @param {Function}    [options.onProgress] ({ status, progress }) => void
-   * @param {number}      [options.startAt]    mock only: initial progress
-   * @returns {Promise<{ videoUrl: string }>}
-   */
-  function generateVideo(options) {
-    return API_CONFIG.USE_MOCK ? mockGenerate(options) : realGenerate(options);
-  }
-
-  /** Downloads via blob when CORS allows it, otherwise opens the video in a new tab. */
-  async function downloadVideo(url, filename = 'frameflow-video.mp4') {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error('Download failed');
-      const blob = await response.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = objectUrl;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
-      return true;
-    } catch (_) {
-      window.open(url, '_blank', 'noopener');
-      return false;
-    }
-  }
-
-  global.VideoAPI = { config: API_CONFIG, generateVideo, downloadVideo, ApiError };
-})(window);
+window.VideoAPI = VideoAPI;
